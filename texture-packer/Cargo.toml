@@ -1,0 +1,14 @@
+[package]
+name = "texture-packer"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+glam = { version = "0.21", features=["bytemuck"]}
+wgpu = { version = "0.14" }
+serde = { version = "1", features=["derive"]}
+bytemuck = { version = "1", features=["derive"]}
+thiserror = "1"
+pollster = "0.2"

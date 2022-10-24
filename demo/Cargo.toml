@@ -1,0 +1,13 @@
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+anyhow = "1"
+winit = "0.27"
+wgpu = {version = "0.14"}
+pollster = "0.2"
+texture-packer = { version="0.1", path="../texture-packer"}
+rand = "0.8"
