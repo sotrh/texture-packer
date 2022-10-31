@@ -20,6 +20,13 @@ struct Uniforms {
 @binding(0)
 var<uniform> uniforms: Uniforms;
 
+@group(1)
+@binding(0)
+var tex: texture_2d<f32>;
+@group(1)
+@binding(1)
+var samp: sampler;
+
 
 @vertex
 fn vs_main(in: RectVertex) -> FsData {
@@ -29,5 +36,5 @@ fn vs_main(in: RectVertex) -> FsData {
 
 @fragment
 fn fs_main(in: FsData) -> @location(0) vec4<f32> {
-    return vec4(1.0);
+    return textureSample(tex, samp, in.uv);
 }

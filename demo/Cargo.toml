@@ -11,3 +11,4 @@ wgpu = {version = "0.14"}
 pollster = "0.2"
 texture-packer = { version="0.1", path="../texture-packer"}
 rand = "0.8"
+glam = "0.22"

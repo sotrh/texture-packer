@@ -1,5 +1,6 @@
-use std::ops::Deref;
+use std::{io::Read, ops::Deref, path::Path};
 
+use image::EncodableLayout;
 use wgpu::{util::DeviceExt, RenderPassColorAttachment};
 
 #[repr(C)]
@@ -10,28 +11,16 @@ pub struct RectVertex {
 }
 
 pub struct RectRenderer {
-    num_rects: u32,
-    capacity: u32,
     format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
-    vertex_buffer: CpuBuffer<Vec<RectVertex>>,
-    index_buffer: CpuBuffer<Vec<u16>>,
     uniform_buffer: CpuBuffer<glam::Mat4>,
     uniform_bg: wgpu::BindGroup,
+    texture_layout: wgpu::BindGroupLayout,
+    default_sampler: wgpu::Sampler,
 }
 
 impl RectRenderer {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, capacity: u32) -> Self {
-        let vertex_buffer = CpuBuffer::new(
-            device,
-            Vec::with_capacity(capacity as _),
-            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        );
-        let index_buffer = CpuBuffer::new(
-            device,
-            Vec::with_capacity(capacity as _),
-            wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-        );
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let uniform_buffer = CpuBuffer::new(
             device,
             glam::Mat4::IDENTITY,
@@ -62,11 +51,34 @@ impl RectRenderer {
             }],
         });
 
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let default_sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+
         let module = device.create_shader_module(wgpu::include_wgsl!("shaders/rect.wgsl"));
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&uniform_layout],
+            bind_group_layouts: &[&uniform_layout, &texture_layout],
             push_constant_ranges: &[],
         });
 
@@ -101,18 +113,45 @@ impl RectRenderer {
         });
 
         Self {
-            num_rects: 0,
-            capacity,
             format,
             pipeline,
-            vertex_buffer,
-            index_buffer,
             uniform_buffer,
             uniform_bg,
+            texture_layout,
+            default_sampler,
         }
     }
 
-    pub fn update_uniforms<C: Camera>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, camera: &C) {
+    pub fn bind_textures(&self, device: &wgpu::Device, textures: &[Texture]) -> TextureBindings {
+        TextureBindings {
+            bindings: textures
+                .iter()
+                .map(|t| {
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.texture_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&t.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.default_sampler),
+                            },
+                        ],
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    pub fn update_uniforms<C: Camera>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        camera: &C,
+    ) {
         self.uniform_buffer
             .update(device, queue, |data| *data = camera.view_matrix());
     }
@@ -135,17 +174,93 @@ impl RectRenderer {
         })
     }
 
-    pub fn render(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
-        let mut pass = Self::create_render_pass(encoder, view);
-        if self.num_rects > 0 {
+    pub fn render(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        batch: &RectBatch,
+        textures: &TextureBindings,
+    ) {
+        let mut pass = Self::create_render_pass(encoder, target);
+        if batch.texture_indices.len() > 0 {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.uniform_bg, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buffer.buffer.slice(..));
+            pass.set_vertex_buffer(0, batch.vertex_buffer.buffer.slice(..));
             pass.set_index_buffer(
-                self.index_buffer.buffer.slice(..),
+                batch.index_buffer.buffer.slice(..),
                 wgpu::IndexFormat::Uint32,
             );
-            pass.draw_indexed(0..self.num_rects * 6, 0, 0..1);
+            for (i, t) in batch.texture_indices.iter().enumerate() {
+                // TODO: maybe check if the texture exists for this rect
+                let texture = &textures.bindings[*t];
+                pass.set_bind_group(1, texture, &[]);
+                pass.draw_indexed(0..6, i as i32 * 4, 0..1);
+            }
+        }
+    }
+}
+
+pub struct TextureBindings {
+    bindings: Vec<wgpu::BindGroup>,
+}
+
+#[derive(Debug)]
+pub struct Rect {
+    pub position: glam::Vec2,
+    pub size: glam::Vec2,
+    pub texture: usize,
+}
+
+pub struct RectBatch {
+    texture_indices: Vec<usize>,
+    vertex_buffer: CpuBuffer<Vec<RectVertex>>,
+    index_buffer: CpuBuffer<[u32; 6]>,
+}
+
+impl RectBatch {
+    pub fn with_rects(
+        device: &wgpu::Device,
+        rects: &[Rect],
+    ) -> Self {
+        let vertices = rects
+            .iter()
+            .flat_map(|r| {
+                let min = r.position;
+                let max = r.position + r.size;
+                [
+                    RectVertex {
+                        position: min,
+                        uv: glam::vec2(0.0, 0.0),
+                    },
+                    RectVertex {
+                        position: glam::vec2(min.x, max.y),
+                        uv: glam::vec2(0.0, 1.0),
+                    },
+                    RectVertex {
+                        position: max,
+                        uv: glam::vec2(1.0, 1.0),
+                    },
+                    RectVertex {
+                        position: glam::vec2(max.x, min.y),
+                        uv: glam::vec2(1.0, 0.0),
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let vertex_buffer = CpuBuffer::new(
+            device,
+            vertices,
+            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::VERTEX,
+        );
+
+        let index_buffer = CpuBuffer::new(device, [0u32, 1, 2, 0, 2, 3], wgpu::BufferUsages::INDEX);
+
+        let texture_indices = rects.iter().map(|r| r.texture).collect::<Vec<_>>();
+
+        Self {
+            texture_indices,
+            vertex_buffer,
+            index_buffer,
         }
     }
 }
@@ -213,6 +328,27 @@ impl<T: bytemuck::Pod + bytemuck::Zeroable> BufferData for Vec<T> {
     #[inline(always)]
     fn capacity_in_bytes(&self) -> u64 {
         (self.capacity() * std::mem::size_of::<T>()) as _
+    }
+}
+
+impl<T: bytemuck::Pod + bytemuck::Zeroable, const S: usize> BufferData for [T; S] {
+    fn as_bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(self)
+    }
+
+    fn from_bytes(&mut self, data: &[u8]) {
+        let data_t: &[T] = bytemuck::cast_slice(data);
+        for (i, t) in data_t.iter().cloned().enumerate() {
+            self[i] = t;
+        }
+    }
+
+    fn size_in_bytes(&self) -> u64 {
+        std::mem::size_of::<Self>() as _
+    }
+
+    fn capacity_in_bytes(&self) -> u64 {
+        self.size_in_bytes()
     }
 }
 
@@ -317,6 +453,15 @@ impl<T: BufferData> CpuBuffer<T> {
     }
 
     #[inline(always)]
+    fn multi_update<'a>(
+        &'a mut self,
+        device: &'a wgpu::Device,
+        queue: &'a wgpu::Queue,
+    ) -> BufferHandle<'a, T> {
+        BufferHandle::new(device, queue, self)
+    }
+
+    #[inline(always)]
     fn get(&self) -> &T {
         &self.data
     }
@@ -324,14 +469,109 @@ impl<T: BufferData> CpuBuffer<T> {
     fn size(&self) -> u64 {
         self.data.size_in_bytes()
     }
+}
 
+pub struct BufferHandle<'a, T: BufferData> {
+    buffer: &'a mut CpuBuffer<T>,
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    dirty: bool,
+}
 
+impl<'a, T: BufferData> BufferHandle<'a, T> {
+    pub fn new(
+        device: &'a wgpu::Device,
+        queue: &'a wgpu::Queue,
+        buffer: &'a mut CpuBuffer<T>,
+    ) -> Self {
+        Self {
+            buffer,
+            dirty: false,
+            device,
+            queue,
+        }
+    }
+}
+
+impl<'a, T: BufferData> Drop for BufferHandle<'a, T> {
+    fn drop(&mut self) {
+        if self.dirty {
+            self.buffer.flush(self.device, self.queue);
+        }
+    }
 }
 
 pub struct Texture {
     inner: wgpu::Texture,
     desc: wgpu::TextureDescriptor<'static>,
     view: wgpu::TextureView,
+}
+
+impl Texture {
+    pub fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+    ) -> Texture {
+        let desc = wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+        };
+        let inner = device.create_texture(&desc);
+        let view = inner.create_view(&wgpu::TextureViewDescriptor::default());
+        Self { inner, desc, view }
+    }
+
+    pub fn open<P: AsRef<Path>>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: P,
+    ) -> Result<Self, crate::Error> {
+        let img = image::open(&path)?.to_rgba8();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let data = img.as_bytes();
+
+        let desc = wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: img.width(),
+                height: img.height(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        };
+        let inner = device.create_texture_with_data(queue, &desc, data);
+        let view = inner.create_view(&wgpu::TextureViewDescriptor::default());
+
+        Ok(Self { inner, desc, view })
+    }
+
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    pub fn size(&self) -> glam::Vec2 {
+        glam::vec2(self.desc.size.width as _, self.desc.size.height as _)
+    }
+
+    pub fn area(&self) -> f32 {
+        (self.desc.size.width * self.desc.size.height) as _
+    }
 }
 
 #[cfg(test)]
