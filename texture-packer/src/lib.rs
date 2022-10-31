@@ -1,7 +1,5 @@
-mod pack;
 use std::path::Path;
 
-pub use pack::*;
 pub mod render;
 
 #[derive(Debug, thiserror::Error)]
@@ -123,7 +121,6 @@ impl TexturePack {
         renderer.update_uniforms(device, queue, &camera);
         let bindings = renderer.bind_textures(device, &in_textures);
 
-        println!("{:#?}", rects);
         let textures = (0..texture_change_indices.len())
             .map(|i| {
                 let mut encoder =

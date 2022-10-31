@@ -29,7 +29,10 @@ fn main() -> anyhow::Result<()> {
         size: 256,
         ..Default::default()
     };
-    let texture_pack = texture_packer::TexturePack::pack_folder(&device, &queue, "./demo/assets", options)?;
+    let pack = texture_packer::TexturePack::pack_folder(&device, &queue, "./demo/assets", options)?;
+    for (i, t) in pack.textures.iter().enumerate() {
+        t.save(&device, &queue, format!("output.{}.png", i))?;
+    }
 
     let format = surface.get_supported_formats(&adapter)[0];
     let mut config = wgpu::SurfaceConfiguration {
@@ -44,9 +47,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut renderer = texture_packer::render::RectRenderer::new(&device, format);
     
-    let bindings = renderer.bind_textures(&device, &texture_pack.textures);
+    let bindings = renderer.bind_textures(&device, &pack.textures);
     let padding = 10.0;
-    let rects = texture_pack.textures.iter().enumerate().map(|(i, t)| {
+    let rects = pack.textures.iter().enumerate().map(|(i, t)| {
         let size = t.size();
         texture_packer::render::Rect {
             position: glam::vec2(i as f32 * (size.x + padding), 0.0),

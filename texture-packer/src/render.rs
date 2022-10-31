@@ -1,4 +1,4 @@
-use std::{io::Read, ops::Deref, path::Path};
+use std::{path::Path, num::NonZeroU32};
 
 use image::EncodableLayout;
 use wgpu::{util::DeviceExt, RenderPassColorAttachment};
@@ -11,7 +11,6 @@ pub struct RectVertex {
 }
 
 pub struct RectRenderer {
-    format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: CpuBuffer<glam::Mat4>,
     uniform_bg: wgpu::BindGroup,
@@ -113,7 +112,6 @@ impl RectRenderer {
         });
 
         Self {
-            format,
             pipeline,
             uniform_buffer,
             uniform_bg,
@@ -230,19 +228,19 @@ impl RectBatch {
                 [
                     RectVertex {
                         position: min,
-                        uv: glam::vec2(0.0, 0.0),
-                    },
-                    RectVertex {
-                        position: glam::vec2(min.x, max.y),
                         uv: glam::vec2(0.0, 1.0),
                     },
                     RectVertex {
+                        position: glam::vec2(min.x, max.y),
+                        uv: glam::vec2(0.0, 0.0),
+                    },
+                    RectVertex {
                         position: max,
-                        uv: glam::vec2(1.0, 1.0),
+                        uv: glam::vec2(1.0, 0.0),
                     },
                     RectVertex {
                         position: glam::vec2(max.x, min.y),
-                        uv: glam::vec2(1.0, 0.0),
+                        uv: glam::vec2(1.0, 1.0),
                     },
                 ]
             })
@@ -436,7 +434,7 @@ impl<T: BufferData> CpuBuffer<T> {
     }
 
     #[inline(always)]
-    fn pull(&mut self, device: &wgpu::Device) {
+    pub fn pull(&mut self, device: &wgpu::Device) {
         let slice = self.buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
@@ -447,13 +445,13 @@ impl<T: BufferData> CpuBuffer<T> {
     }
 
     #[inline(always)]
-    fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mut f: impl FnMut(&mut T)) {
+    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mut f: impl FnMut(&mut T)) {
         f(&mut self.data);
         self.flush(device, queue);
     }
 
     #[inline(always)]
-    fn multi_update<'a>(
+    pub fn multi_update<'a>(
         &'a mut self,
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
@@ -462,11 +460,11 @@ impl<T: BufferData> CpuBuffer<T> {
     }
 
     #[inline(always)]
-    fn get(&self) -> &T {
+    pub fn get(&self) -> &T {
         &self.data
     }
 
-    fn size(&self) -> u64 {
+    pub fn size(&self) -> u64 {
         self.data.size_in_bytes()
     }
 }
@@ -559,6 +557,65 @@ impl Texture {
         let view = inner.create_view(&wgpu::TextureViewDescriptor::default());
 
         Ok(Self { inner, desc, view })
+    }
+
+    pub fn save<P: AsRef<Path>>(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: P,
+    ) -> Result<(), crate::Error> {
+        let bytes_per_row = std::mem::size_of::<[u8; 4]>() as u32 * self.desc.size.width;
+        let padding = (wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+            - bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = bytes_per_row + padding;
+        let buffer_size = (padded_bytes_per_row * self.desc.size.height) as _;
+        let buffer_desc = wgpu::BufferDescriptor {
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            label: Some("Save Buffer"),
+            mapped_at_creation: false,
+        };
+        let buffer = device.create_buffer(&buffer_desc);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_texture_to_buffer(
+            self.inner.as_image_copy(),
+            wgpu::ImageCopyBuffer {
+                buffer: &buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: NonZeroU32::new(padded_bytes_per_row),
+                    rows_per_image: NonZeroU32::new(self.desc.size.height),
+                },
+            },
+            self.desc.size,
+        );
+        queue.submit([encoder.finish()]);
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+
+        let data = slice
+            .get_mapped_range()
+            .chunks(padded_bytes_per_row as _)
+            .map(|chunk| &chunk[..bytes_per_row as _])
+            .flatten()
+            .map(|x| *x)
+            .collect::<Vec<_>>();
+        buffer.unmap();
+        
+        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+            self.desc.size.width,
+            self.desc.size.height,
+            data,
+        ).unwrap()
+        .save(path)?;
+
+        Ok(())
     }
 
     pub fn view(&self) -> &wgpu::TextureView {
