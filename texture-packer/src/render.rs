@@ -202,7 +202,7 @@ pub struct TextureBindings {
     bindings: Vec<wgpu::BindGroup>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
 pub struct Rect {
     pub position: glam::Vec2,
     pub size: glam::Vec2,

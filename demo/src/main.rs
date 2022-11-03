@@ -30,9 +30,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let pack = texture_packer::TexturePack::pack_folder(&device, &queue, "./demo/assets", options)?;
-    for (i, t) in pack.textures.iter().enumerate() {
-        t.save(&device, &queue, format!("output.{}.png", i))?;
-    }
+    pack.save(&device, &queue, "target")?;
 
     let format = surface.get_supported_formats(&adapter)[0];
     let mut config = wgpu::SurfaceConfiguration {
